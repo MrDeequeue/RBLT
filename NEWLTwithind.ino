@@ -5,6 +5,7 @@
 #include <Arduino_GFX_Library.h>
 #include <Wire.h>
 #include "bsp_cst816.h"
+#include "racebox_ble.h"   // *** NEW ***
 
 // -------------------------
 // Physical panel pinout
@@ -18,6 +19,11 @@
 #define TFT_SCLK   39
 #define TP_SDA     48
 #define TP_SCL     47
+
+// define physical buttons
+#define BTN_PREV   6
+#define BTN_NEXT   7
+#define BTN_STOP   8
 
 // -------------------------
 // SD card
@@ -87,18 +93,32 @@ bool sdOk = false;
 
 unsigned long currentLapStartMs = 0;
 bool haveCurrentLap = false;
+bool recordingEnabled = true;
+
+// =======================
+// HARDWARE BUTTON STATE
+// =======================
+static int lastPrevState = HIGH;
+static int lastNextState = HIGH;
+static int lastStopState = HIGH;
+static unsigned long lastHwBtnMs = 0;
+const unsigned long HW_BTN_DEBOUNCE_MS = 200;
 
 // =======================
 // SESSION STATE
 // =======================
 bool sessionActive = false;
 bool sessionWasManuallyStopped = false;
-bool autoStartEnabled = true;   // << NEW
+bool autoStartEnabled = true;
 unsigned long lowSpeedStartMs = 0;
 
+// These remain, but are now fed from RaceBox when available.
 float currentSpeedKPH = 0.0f;
 bool  rbHasSpeed      = false;
 float fakeSpeedKPH    = 0.0f;
+
+bool fakeOverrideEnabled = false;
+float fakeOverrideSpeedKPH = 0.0f;
 
 // =======================
 // LVGL UI objects
@@ -373,7 +393,7 @@ void setCurrentTrack(int idx) {
 static int lastSide = 0;
 static bool haveLastSide = false;
 
-const float MIN_LAP_TIME_SEC = 1.0f;
+const float MIN_LAP_TIME_SEC = 10.0f;
 
 static float signedDistanceToLine(float x, float y) {
   float vx = x - sfLine.xL;
@@ -426,16 +446,32 @@ void updateLapFromLatLon(double lat, double lon) {
   storeLap(lapTime);
 }
 
+void resetStoredLapsForCurrentTrack() {
+    storedLapCount = 0;
+    totalLapCount = 0;
+
+    // Preserve best_lap_ms — do not touch
+
+    // Clear memory buffer
+    for (int i = 0; i < MAX_STORED_LAPS; i++) {
+        lapTimes[i] = 0;
+    }
+
+    update_ui();
+    Serial.printf("Stored laps reset for track %s\n",
+                  TRACKS[currentTrackIndex].name);
+}
+
+
 // =======================
 // FAKE GPS + SPEED MODEL
 // =======================
 static float simPhase = 0.0f;
-static bool uiHasDrawnOnce = false;   // Prevent instant green on boot
+static bool uiHasDrawnOnce = false;
 
 void feedFakeGps() {
   if (!sfLine.ready) return;
 
-  // Delay fake-speed activation until FIRST UI frame has been painted
   if (!uiHasDrawnOnce) {
     fakeSpeedKPH = 0;
     return;
@@ -456,7 +492,6 @@ void feedFakeGps() {
   double lat, lon;
   xyToLatLon(x, y, lat, lon);
 
-  // Derive fake speed from simPhase
   fakeSpeedKPH = fabsf(sinf(simPhase)) * 120.0f;
 
   updateLapFromLatLon(lat, lon);
@@ -466,18 +501,20 @@ void feedFakeGps() {
 // SESSION AUTO-START / STOP
 // =============================
 void sessionAutoController() {
+  float speed;
 
-  // Choose real RaceBox speed (if available) else fake speed
-  float speed = rbHasSpeed ? currentSpeedKPH : fakeSpeedKPH;
+  if (fakeOverrideEnabled) {
+    speed = fakeOverrideSpeedKPH;
+  } else if (rbHasSpeed) {
+    speed = currentSpeedKPH;
+  } else {
+    speed = fakeSpeedKPH;
+  }
 
-  // ---------- AUTO START ----------
-  // Only if:
-  //  • Session is inactive
-  //  • autoStartEnabled is true
-  //  • speed > 20 km/h
+  // AUTO START
   if (!sessionActive &&
       autoStartEnabled &&
-      speed > 20.0f)
+      speed > 30.0f)
   {
     sessionActive = true;
     sessionWasManuallyStopped = false;
@@ -486,20 +523,15 @@ void sessionAutoController() {
     Serial.println("SESSION AUTO-STARTED");
   }
 
-  // ---------- AUTO STOP ----------
+  // AUTO STOP
   if (sessionActive) {
     if (speed < 10.0f) {
       if (lowSpeedStartMs == 0) {
         lowSpeedStartMs = millis();
       } else if (millis() - lowSpeedStartMs > 5000) {
-
-        // Auto-stop event
         sessionActive = false;
         sessionWasManuallyStopped = false;
-
-        // Crucial: allow new sessions to start automatically
         autoStartEnabled = true;
-
         haveCurrentLap = false;
         lowSpeedStartMs = 0;
         Serial.println("SESSION AUTO-STOPPED");
@@ -508,6 +540,105 @@ void sessionAutoController() {
       lowSpeedStartMs = 0;
     }
   }
+}
+
+void stopSessionManual() {
+  sessionActive = false;
+  sessionWasManuallyStopped = true;
+  autoStartEnabled = true;
+  haveCurrentLap = false;
+  recordingEnabled = true;
+  lowSpeedStartMs = 0;
+
+  update_ui();
+  Serial.println("SESSION MANUALLY STOPPED");
+}
+// =============================
+// Current track reset popup
+// =============================
+
+static lv_obj_t *reset_mbox = NULL;
+
+static void reset_mbox_event_cb(lv_event_t *e) {
+    lv_obj_t *mbox = lv_event_get_current_target(e);   // <-- this is the msgbox
+    const char *btn_txt = lv_msgbox_get_active_btn_text(mbox);
+
+    if (btn_txt && strcmp(btn_txt, "OK") == 0) {
+        resetStoredLapsForCurrentTrack();
+    }
+
+    lv_msgbox_close(mbox);
+    reset_mbox = NULL;
+}
+
+static void show_reset_popup() {
+    if (reset_mbox != NULL) return;   // Already open
+
+    static const char *btns[] = { "OK", "Cancel", "" };
+
+    reset_mbox = lv_msgbox_create(NULL,
+                                  "Reset Lap Times?",
+                                  "Clear stored laps for this track?\n"
+                                  "(Best lap will be kept)",
+                                  btns, false);
+
+    lv_obj_center(reset_mbox);
+
+    // Attach the callback to the MSGBOX — NOT the button matrix
+    lv_obj_add_event_cb(reset_mbox,
+                        reset_mbox_event_cb,
+                        LV_EVENT_VALUE_CHANGED,
+                        NULL);
+}
+
+//==============================
+// Hardware button stuff for later
+//==============================
+
+void handleHardwareButtons() {
+  unsigned long now = millis();
+
+  // Simple global debounce: ignore checks too soon after a press
+  if (now - lastHwBtnMs < HW_BTN_DEBOUNCE_MS) {
+    return;
+  }
+
+  int prevState = digitalRead(BTN_PREV);
+  int nextState = digitalRead(BTN_NEXT);
+  int stopState = digitalRead(BTN_STOP);
+
+  // ---------- Previous track (falling edge: HIGH -> LOW) ----------
+  if (prevState == LOW && lastPrevState == HIGH) {
+    int idx = (currentTrackIndex - 1 + TRACK_COUNT) % TRACK_COUNT;
+
+    // Use setCurrentTrack so laps & session state are handled consistently
+    setCurrentTrack(idx);
+    saveTrackToSD();
+
+    lastHwBtnMs = now;
+  }
+
+  // ---------- Next track (falling edge) ----------
+  if (nextState == LOW && lastNextState == HIGH) {
+    int idx = (currentTrackIndex + 1) % TRACK_COUNT;
+
+    setCurrentTrack(idx);
+    saveTrackToSD();
+
+    lastHwBtnMs = now;
+  }
+
+  // ---------- Stop recording (falling edge) ----------
+  if (stopState == LOW && lastStopState == HIGH) {
+    stopSessionManual();
+    Serial.println("SESSION STOPPED BY HARDWARE BUTTON");
+    lastHwBtnMs = now;
+  }
+
+  // Remember previous states for edge detection
+  lastPrevState = prevState;
+  lastNextState = nextState;
+  lastStopState = stopState;
 }
 
 // =======================
@@ -532,15 +663,7 @@ static void track_btn_event_cb(lv_event_t *e) {
 
 static void stop_btn_event_cb(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  sessionActive = false;
-  sessionWasManuallyStopped = true;
-  autoStartEnabled = false;    // <<< BLOCK AUTO-START
-  haveCurrentLap = false;
-  lowSpeedStartMs = 0;
-
-  update_ui();
-  Serial.println("SESSION MANUALLY STOPPED");
+  stopSessionManual();
 }
 
 // =======================
@@ -591,16 +714,16 @@ void lvgl_ui_init() {
     lv_label_set_text(labels_prev[i], "");
   }
 
-  // -------- STOP button (bottom-right) --------
+  /* -------- STOP button (bottom-right) --------
   btn_stop = lv_btn_create(lv_scr_act());
   lv_obj_set_size(btn_stop, 60, 30);
-  lv_obj_align(btn_stop, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+  lv_obj_align(btn_stop, LV_ALIGN_BOTTOM_RIGHT, -10, -50);
   lv_obj_add_event_cb(btn_stop, stop_btn_event_cb, LV_EVENT_CLICKED, NULL);
   {
     lv_obj_t *lbl = lv_label_create(btn_stop);
     lv_label_set_text(lbl, "STOP");
     lv_obj_center(lbl);
-  }
+  }*/
 
   // -------- Track prev "<" --------
   btn_prev_track = lv_btn_create(lv_scr_act());
@@ -616,7 +739,7 @@ void lvgl_ui_init() {
   // -------- Track next ">" --------
   btn_next_track = lv_btn_create(lv_scr_act());
   lv_obj_set_size(btn_next_track, 40, 30);
-  lv_obj_align(btn_next_track, LV_ALIGN_BOTTOM_RIGHT, -10, -50);
+  lv_obj_align(btn_next_track, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
   lv_obj_add_event_cb(btn_next_track, track_btn_event_cb, LV_EVENT_CLICKED, NULL);
   {
     lv_obj_t *lbl = lv_label_create(btn_next_track);
@@ -628,6 +751,43 @@ void lvgl_ui_init() {
   label_track = lv_label_create(lv_scr_act());
   lv_label_set_text(label_track, TRACKS[currentTrackIndex].name);
   lv_obj_align(label_track, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+  // ----- FAKE SPEED 120 -----
+  lv_obj_t *btn_fake120 = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(btn_fake120, 60, 30);
+  lv_obj_align(btn_fake120, LV_ALIGN_BOTTOM_RIGHT, -10, -50);
+  lv_obj_add_event_cb(btn_fake120, [](lv_event_t *e){
+    fakeOverrideEnabled = true;
+    fakeOverrideSpeedKPH = 120.0f;
+    Serial.println("FAKE SPEED SET TO 120");
+  }, LV_EVENT_CLICKED, NULL);
+  {
+    lv_obj_t *lbl = lv_label_create(btn_fake120);
+    lv_label_set_text(lbl, "120");
+    lv_obj_center(lbl);
+  }
+
+  // ----- FAKE SPEED 0 -----
+  lv_obj_t *btn_fake0 = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(btn_fake0, 60, 30);
+  lv_obj_align(btn_fake0, LV_ALIGN_BOTTOM_RIGHT, -10, -100);
+  lv_obj_add_event_cb(btn_fake0, [](lv_event_t *e){
+    fakeOverrideEnabled = true;
+    fakeOverrideSpeedKPH = 0.0f;
+    Serial.println("FAKE SPEED SET TO 0");
+  }, LV_EVENT_CLICKED, NULL);
+  {
+    lv_obj_t *lbl = lv_label_create(btn_fake0);
+    lv_label_set_text(lbl, "0");
+    lv_obj_center(lbl);
+  }
+
+  // ----- Long press anywhere to reset laps -----
+  lv_obj_add_event_cb(lv_scr_act(), [](lv_event_t *e){
+    if (lv_event_get_code(e) == LV_EVENT_LONG_PRESSED) {
+        show_reset_popup();
+    }
+  }, LV_EVENT_LONG_PRESSED, NULL);
 }
 
 // =======================
@@ -744,14 +904,19 @@ void update_ui() {
   uiHasDrawnOnce = true;   // First valid frame happened
 }
 
-// =======================
+/// =======================
 // ARDUINO SETUP
 // =======================
 void setup() {
   Serial.begin(115200);
   Serial.println("Lap Timer + FakeGPS + Per-Track Storage + Session Logic");
 
-  // -------- Display Init --------
+  // Hardware buttons
+  pinMode(BTN_PREV, INPUT_PULLUP);
+  pinMode(BTN_NEXT, INPUT_PULLUP);
+  pinMode(BTN_STOP, INPUT_PULLUP);
+
+  // Display Init
   if (!gfx->begin()) {
     Serial.println("gfx->begin() failed!");
     while (1);
@@ -761,7 +926,7 @@ void setup() {
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
 
-  // -------- LVGL Init --------
+  // LVGL Init
   lv_init();
 
   static lv_disp_draw_buf_t draw_buf;
@@ -792,7 +957,7 @@ void setup() {
 
   lv_disp_drv_register(&disp_drv);
 
-  // -------- Touch Init --------
+  // Touch Init
   Wire.begin(TP_SDA, TP_SCL);
   bsp_touch_init(&Wire, gfx->getRotation(), LCD_WIDTH, LCD_HEIGHT);
 
@@ -802,14 +967,17 @@ void setup() {
   indev_drv.read_cb = touchpad_read;
   touch_indev = lv_indev_drv_register(&indev_drv);
 
-  // -------- SD + Track Load --------
+  // SD + Track/Laps
   initSD();
   loadTrackFromSD();
   loadLapsFromSD();
 
-  // -------- Build UI --------
+  // Build UI
   lvgl_ui_init();
   update_ui();
+
+  // *** RaceBox BLE init (Core 0 task) ***
+  racebox_init();
 
   Serial.println("Setup complete.");
 }
@@ -819,19 +987,48 @@ void setup() {
 // =======================
 void loop() {
 
-  // 1) GPS / Fake GPS feed (updates fakeSpeedKPH)
-  feedFakeGps();
+  // *** 1) RaceBox vs Fake GPS ***
+  if (recordingEnabled) {
+    RaceboxSnapshot rbx;
+    racebox_get_snapshot(rbx);
 
-  // 2) Session auto-start / auto-stop
+    if (racebox_has_valid_fix()) {
+      // Real RaceBox data
+      rbHasSpeed      = true;
+      currentSpeedKPH = rbx.speedKPH;
+      fakeSpeedKPH    = 0.0f;
+
+      // Use real GNSS for lap detection once lat/lon are wired.
+      if (rbx.latDeg != 0.0 || rbx.lonDeg != 0.0) {
+        updateLapFromLatLon(rbx.latDeg, rbx.lonDeg);
+      }
+    } else {
+      // Fallback: fake GPS path
+      rbHasSpeed = false;
+      feedFakeGps();
+      currentSpeedKPH = fakeSpeedKPH;
+    }
+  } else {
+    rbHasSpeed      = false;
+    currentSpeedKPH = 0.0f;
+  }
+
+  // *** 1b) BLE housekeeping (cheap, non-blocking) ***
+  racebox_tick();
+
+  // 2) Session auto-start / stop
   sessionAutoController();
 
-  // 3) Serial commands: track switching
+  // 3) Serial commands
   handleSerialCommands();
 
-  // 4) UI update
+  // 4) Hardware input
+  handleHardwareButtons();
+
+  // 5) UI update
   update_ui();
 
-  // 5) LVGL internal housekeeping
+  // 6) LVGL
   lv_tick_inc(20);
   lv_timer_handler();
 
