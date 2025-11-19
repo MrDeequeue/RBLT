@@ -133,6 +133,7 @@ static lv_obj_t *btn_prev_track;
 static lv_obj_t *btn_next_track;
 static lv_obj_t *btn_stop;
 static lv_obj_t *status_dot;
+static lv_obj_t *status_GPS;
 
 // =======================
 // GEO + SF LINE
@@ -447,20 +448,47 @@ void updateLapFromLatLon(double lat, double lon) {
 }
 
 void resetStoredLapsForCurrentTrack() {
+    // Preserve best_lap_ms
+    unsigned long preservedBest = best_lap_ms;
+
+    // Clear in-memory laps
     storedLapCount = 0;
-    totalLapCount = 0;
+    totalLapCount  = 0;
 
-    // Preserve best_lap_ms — do not touch
-
-    // Clear memory buffer
     for (int i = 0; i < MAX_STORED_LAPS; i++) {
         lapTimes[i] = 0;
     }
 
+    // Remove old CSV
+    String fileName = getTrackFileName();
+    if (SD.exists(fileName)) {
+        SD.remove(fileName);
+        Serial.printf("Deleted SD file: %s\n", fileName.c_str());
+    }
+
+    // Recreate CSV with ONLY the best lap (if valid)
+    if (preservedBest < 0xFFFFFFFF) {
+        File f = SD.open(fileName, FILE_WRITE);
+        if (f) {
+            char buf[16];
+            formatLapTime(buf, sizeof(buf), preservedBest);
+            f.printf("%lu,%s,1\n", preservedBest, buf); // mark as best
+            f.close();
+            Serial.printf("Recreated CSV with preserved best lap: %lu ms\n", preservedBest);
+        }
+        // Re-add the best lap to memory
+        lapTimes[0] = preservedBest;
+        storedLapCount = 1;
+        totalLapCount  = 1;
+    }
+
+    // Push changes to UI
     update_ui();
-    Serial.printf("Stored laps reset for track %s\n",
+
+    Serial.printf("Stored laps reset (best lap preserved) for track %s\n",
                   TRACKS[currentTrackIndex].name);
 }
+
 
 
 // =======================
@@ -681,6 +709,19 @@ void lvgl_ui_init() {
   lv_obj_clear_flag(status_dot, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_align(status_dot, LV_ALIGN_TOP_LEFT, 10, 10);
 
+  // -------- GPS Status Dot --------
+  status_GPS = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(status_GPS, 12, 12);
+  lv_obj_set_style_radius(status_GPS, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_border_width(status_GPS, 0, 0);
+  lv_obj_clear_flag(status_GPS, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_align(status_GPS, LV_ALIGN_TOP_RIGHT, -10, 10);
+
+  // Initial colour — safe default
+  lv_obj_set_style_bg_color(status_GPS, lv_palette_main(LV_PALETTE_RED), 0);
+
+
+
   // -------- "Lap:" prefix --------
   label_lap_prefix = lv_label_create(lv_scr_act());
   lv_label_set_text(label_lap_prefix, "Lap:");
@@ -752,6 +793,22 @@ void lvgl_ui_init() {
   lv_label_set_text(label_track, TRACKS[currentTrackIndex].name);
   lv_obj_align(label_track, LV_ALIGN_BOTTOM_MID, 0, -10);
 
+  // ----- REAL GPS button -----
+  lv_obj_t *btn_real = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(btn_real, 60, 30);
+  lv_obj_align(btn_real, LV_ALIGN_BOTTOM_RIGHT, -10, -120);
+  lv_obj_add_event_cb(btn_real, [](lv_event_t *e){
+    fakeOverrideEnabled = false;
+    Serial.println("FAKE MODE DISABLED - REAL GNSS ACTIVE");
+  }, LV_EVENT_CLICKED, NULL);
+
+{
+    lv_obj_t *lbl = lv_label_create(btn_real);
+    lv_label_set_text(lbl, "REAL");
+    lv_obj_center(lbl);
+}
+
+
   // ----- FAKE SPEED 120 -----
   lv_obj_t *btn_fake120 = lv_btn_create(lv_scr_act());
   lv_obj_set_size(btn_fake120, 60, 30);
@@ -770,7 +827,7 @@ void lvgl_ui_init() {
   // ----- FAKE SPEED 0 -----
   lv_obj_t *btn_fake0 = lv_btn_create(lv_scr_act());
   lv_obj_set_size(btn_fake0, 60, 30);
-  lv_obj_align(btn_fake0, LV_ALIGN_BOTTOM_RIGHT, -10, -100);
+  lv_obj_align(btn_fake0, LV_ALIGN_BOTTOM_RIGHT, -10, -85);
   lv_obj_add_event_cb(btn_fake0, [](lv_event_t *e){
     fakeOverrideEnabled = true;
     fakeOverrideSpeedKPH = 0.0f;
@@ -901,7 +958,25 @@ void update_ui() {
 
   lv_obj_set_style_bg_color(status_dot, col, 0);
 
+  // -------- GPS Status Dot --------
+  lv_color_t gpsCol;
+  if (fakeOverrideEnabled) {
+    gpsCol = lv_palette_main(LV_PALETTE_CYAN);    // pretend no fix
+  }
+  else if (racebox_has_valid_fix()) {
+    gpsCol = lv_palette_main(LV_PALETTE_GREEN);  // real fix
+  }
+  else if (rbHasSpeed) {
+    gpsCol = lv_palette_main(LV_PALETTE_ORANGE); // BLE but no fix
+  }
+  else {
+    gpsCol = lv_palette_main(LV_PALETTE_RED);    // no data
+  }
+
+  lv_obj_set_style_bg_color(status_GPS, gpsCol, 0);
+
   uiHasDrawnOnce = true;   // First valid frame happened
+
 }
 
 /// =======================
@@ -987,30 +1062,91 @@ void setup() {
 // =======================
 void loop() {
 
-  // *** 1) RaceBox vs Fake GPS ***
-  if (recordingEnabled) {
-    RaceboxSnapshot rbx;
-    racebox_get_snapshot(rbx);
+  // ===========================================
+// 1) RaceBox vs Fake GPS + GPS Outage Grace
+// ===========================================
+  {
+    // How long we tolerate missing GPS before stopping session
+    const unsigned long GPS_OUTAGE_GRACE_MS = 5000;
+    static unsigned long gpsLossStart = 0;
 
-    if (racebox_has_valid_fix()) {
-      // Real RaceBox data
-      rbHasSpeed      = true;
-      currentSpeedKPH = rbx.speedKPH;
-      fakeSpeedKPH    = 0.0f;
+    if (recordingEnabled)
+    {
+        // -------------------------
+        // FAKE OVERRIDE MODE
+        // -------------------------
+        if (fakeOverrideEnabled)
+        {
+            // Force fake GNSS path
+            feedFakeGps();
+            currentSpeedKPH = fakeOverrideSpeedKPH;
+            rbHasSpeed = false;       // pretend no RaceBox data
+            gpsLossStart = 0;         // fake mode means no outage logic
+        }
 
-      // Use real GNSS for lap detection once lat/lon are wired.
-      if (rbx.latDeg != 0.0 || rbx.lonDeg != 0.0) {
-        updateLapFromLatLon(rbx.latDeg, rbx.lonDeg);
-      }
-    } else {
-      // Fallback: fake GPS path
-      rbHasSpeed = false;
-      feedFakeGps();
-      currentSpeedKPH = fakeSpeedKPH;
+        // -------------------------
+        // REAL MODE (RaceBox only)
+        // -------------------------
+        else
+        {
+            RaceboxSnapshot rbx;
+            racebox_get_snapshot(rbx);
+
+            if (racebox_has_valid_fix())
+            {
+                // FULL REAL GNSS AVAILABLE
+                rbHasSpeed      = true;
+                currentSpeedKPH = rbx.speedKPH;
+
+                gpsLossStart = 0; // reset outage timer
+
+                if (rbx.latDeg != 0.0 || rbx.lonDeg != 0.0)
+                    updateLapFromLatLon(rbx.latDeg, rbx.lonDeg);
+            }
+            else
+            {
+                // NO FIX — apply GRACE LOGIC
+                rbHasSpeed = false;
+
+                if (gpsLossStart == 0)
+                {
+                    gpsLossStart = millis();   // begin outage window
+                }
+
+                unsigned long outage = millis() - gpsLossStart;
+
+                if (outage >= GPS_OUTAGE_GRACE_MS)
+                {
+                    // FIX REALLY LOST → zero speed
+                    currentSpeedKPH = 0.0f;
+
+                    if (sessionActive)
+                    {
+                        sessionActive = false;
+                        sessionWasManuallyStopped = false;
+                        autoStartEnabled = true;
+                        haveCurrentLap = false;
+                        lowSpeedStartMs = 0;
+                        Serial.println("SESSION STOPPED (GPS LOST)");
+                    }
+                }
+                else
+                {
+                    // grace period active → do not kill session yet
+                    // hold last known speed, don't simulate movement
+                    // If you prefer “force 0” here, change this line:
+                    currentSpeedKPH = currentSpeedKPH;
+                }
+            }
+        }
     }
-  } else {
-    rbHasSpeed      = false;
-    currentSpeedKPH = 0.0f;
+    else
+    {
+        // Recording disabled = hard stop on everything
+        rbHasSpeed      = false;
+        currentSpeedKPH = 0.0f;
+        gpsLossStart    = 0;
+    }
   }
 
   // *** 1b) BLE housekeeping (cheap, non-blocking) ***
