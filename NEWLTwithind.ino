@@ -121,7 +121,7 @@ bool fakeOverrideEnabled = false;
 float fakeOverrideSpeedKPH = 0.0f;
 
 // =======================
-// LVGL UI objects
+// LVGL LAP objects
 // =======================
 static lv_obj_t *label_current_lap;
 static lv_obj_t *label_lap_prefix;
@@ -134,6 +134,59 @@ static lv_obj_t *btn_next_track;
 static lv_obj_t *btn_stop;
 static lv_obj_t *status_dot;
 static lv_obj_t *status_GPS;
+
+// =======================
+// TELEMETRY PAGE OBJECTS
+// =======================
+
+static bool onTelemetryPage = false;
+
+// Telemetry UI objects
+static lv_obj_t *label_speed = nullptr;
+static lv_obj_t *label_lean = nullptr;
+static lv_obj_t *label_max_left = nullptr;
+static lv_obj_t *label_max_right = nullptr;
+static lv_obj_t *label_yawpitch = nullptr;
+
+// Lean gauge
+static lv_obj_t *gauge_arc = nullptr;
+static lv_obj_t *needle_line = nullptr;
+static lv_obj_t *max_left_line = nullptr;
+static lv_obj_t *max_right_line = nullptr;
+
+static lv_obj_t *screen_lap = nullptr;
+static lv_obj_t *screen_tele = nullptr;
+
+
+// Line point buffers (must live as long as objects)
+static lv_point_t needle_points[2];
+static lv_point_t max_left_points[2];
+static lv_point_t max_right_points[2];
+
+// Telemetry data (to be driven from RaceBox later)
+static float tele_lean_deg       = 0.0f;
+static float tele_max_lean_left  = 0.0f;   // usually negative (left)
+static float tele_max_lean_right = 0.0f;   // positive (right)
+static float tele_yaw_deg        = 0.0f;
+static float tele_pitch_deg      = 0.0f;
+// For now, we just use currentSpeedKPH for speed display
+
+// Long-press timing (shared)
+const unsigned long LONG_PRESS_MS = 800;
+
+// REAL button press timing
+static unsigned long uiRealPressStart = 0;
+static bool uiRealPressed = false;
+
+// Hardware STOP timing
+static unsigned long hwStopPressStart = 0;
+static bool hwStopPressed = false;
+static bool hwStopLongHandled = false;
+
+// Gauge long-press timing
+static unsigned long gaugePressStart = 0;
+static bool gaugePressed = false;
+
 
 // =======================
 // GEO + SF LINE
@@ -301,6 +354,14 @@ void loadLapsFromSD() {
 }
 
 // =======================
+// Init the telemetry page
+// =======================
+
+void telemetry_ui_init();
+void update_telemetry_ui();
+void togglePage();
+
+// =======================
 // SF LINE INIT
 // =======================
 void initStartFinishLine(double lat_left, double lon_left,
@@ -386,6 +447,23 @@ void setCurrentTrack(int idx) {
   loadLapsFromSD();
 
   update_ui();
+}
+
+// ======================
+// page switcher
+// ======================
+
+void togglePage() {
+  if (onTelemetryPage) {
+    // Back to lap page
+    onTelemetryPage = false;
+    lvgl_ui_init();
+    update_ui();
+  } else {
+    // Go to telemetry page
+    telemetry_ui_init();
+    update_telemetry_ui();
+  }
 }
 
 // =======================
@@ -626,11 +704,6 @@ static void show_reset_popup() {
 void handleHardwareButtons() {
   unsigned long now = millis();
 
-  // Simple global debounce: ignore checks too soon after a press
-  if (now - lastHwBtnMs < HW_BTN_DEBOUNCE_MS) {
-    return;
-  }
-
   int prevState = digitalRead(BTN_PREV);
   int nextState = digitalRead(BTN_NEXT);
   int stopState = digitalRead(BTN_STOP);
@@ -656,11 +729,34 @@ void handleHardwareButtons() {
     lastHwBtnMs = now;
   }
 
-  // ---------- Stop recording (falling edge) ----------
-  if (stopState == LOW && lastStopState == HIGH) {
+  // ---------- Stop button (short/long) ----------
+  if (stopState == LOW && !hwStopPressed) {
+    // Just pressed
+    hwStopPressed = true;
+    hwStopLongHandled = false;
+    hwStopPressStart = now;
+  }
+
+  if (stopState == LOW && hwStopPressed && !hwStopLongHandled) {
+    if (now - hwStopPressStart >= LONG_PRESS_MS) {
+    // LONG PRESS → stop session
     stopSessionManual();
-    Serial.println("SESSION STOPPED BY HARDWARE BUTTON");
+    Serial.println("SESSION STOPPED (HW LONG PRESS)");
+    hwStopLongHandled = true;
     lastHwBtnMs = now;
+    }
+  }
+
+  if (stopState == HIGH && hwStopPressed) {
+  // Released
+  if (!hwStopLongHandled) {
+    // SHORT PRESS → page toggle
+    togglePage();
+    Serial.println("PAGE SWITCH (HW SHORT PRESS)");
+    lastHwBtnMs = now;
+  }
+  hwStopPressed = false;
+  hwStopLongHandled = false;
   }
 
   // Remember previous states for edge detection
@@ -695,14 +791,17 @@ static void stop_btn_event_cb(lv_event_t *e) {
 }
 
 // =======================
-// LVGL UI BUILD
+// LVGL Lap UI
 // =======================
 
 void lvgl_ui_init() {
-  lv_obj_clean(lv_scr_act());
+  
+  // Create a **dedicated screen** for the lap page
+    screen_lap = lv_obj_create(NULL);
+    lv_scr_load(screen_lap);
 
   // -------- Status dot (top-left) --------
-  status_dot = lv_obj_create(lv_scr_act());
+  status_dot = lv_obj_create(screen_lap);
   lv_obj_set_size(status_dot, 12, 12);
   lv_obj_set_style_radius(status_dot, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_border_width(status_dot, 0, 0);
@@ -710,7 +809,7 @@ void lvgl_ui_init() {
   lv_obj_align(status_dot, LV_ALIGN_TOP_LEFT, 10, 10);
 
   // -------- GPS Status Dot --------
-  status_GPS = lv_obj_create(lv_scr_act());
+  status_GPS = lv_obj_create(screen_lap);
   lv_obj_set_size(status_GPS, 12, 12);
   lv_obj_set_style_radius(status_GPS, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_border_width(status_GPS, 0, 0);
@@ -723,51 +822,41 @@ void lvgl_ui_init() {
 
 
   // -------- "Lap:" prefix --------
-  label_lap_prefix = lv_label_create(lv_scr_act());
+  label_lap_prefix = lv_label_create(screen_lap);
   lv_label_set_text(label_lap_prefix, "Lap:");
   lv_obj_set_style_text_font(label_lap_prefix, &lv_font_montserrat_28, 0);
   lv_obj_align(label_lap_prefix, LV_ALIGN_TOP_LEFT, 30, 8);
 
   // -------- Current lap time --------
-  label_current_lap = lv_label_create(lv_scr_act());
+  label_current_lap = lv_label_create(screen_lap);
   lv_label_set_text(label_current_lap, "--:--.---");
   lv_obj_set_style_text_font(label_current_lap, &lv_font_montserrat_28, 0);
   lv_obj_align_to(label_current_lap, label_lap_prefix,
                   LV_ALIGN_OUT_RIGHT_MID, 10, 0);
 
   // -------- Best lap --------
-  label_best_lap = lv_label_create(lv_scr_act());
+  label_best_lap = lv_label_create(screen_lap);
   lv_obj_align(label_best_lap, LV_ALIGN_TOP_LEFT, 10, 48);
   lv_obj_set_style_text_font(label_best_lap, &lv_font_montserrat_16, 0);
   lv_label_set_text(label_best_lap, "Best: --:--.---");
 
   // -------- Lap count --------
-  label_lap_count = lv_label_create(lv_scr_act());
+  label_lap_count = lv_label_create(screen_lap);
   lv_obj_align(label_lap_count, LV_ALIGN_TOP_RIGHT, -10, 48);
   lv_obj_set_style_text_font(label_lap_count, &lv_font_montserrat_16, 0);
   lv_label_set_text(label_lap_count, "Laps: 0");
 
   // -------- Previous laps --------
   for (uint8_t i = 0; i < NUM_DISPLAY_PREV; i++) {
-    labels_prev[i] = lv_label_create(lv_scr_act());
+    labels_prev[i] = lv_label_create(screen_lap);
     lv_obj_align(labels_prev[i], LV_ALIGN_TOP_LEFT, 10, 75 + i * 22);
     lv_obj_set_style_text_font(labels_prev[i], &lv_font_montserrat_14, 0);
     lv_label_set_text(labels_prev[i], "");
   }
 
-  /* -------- STOP button (bottom-right) --------
-  btn_stop = lv_btn_create(lv_scr_act());
-  lv_obj_set_size(btn_stop, 60, 30);
-  lv_obj_align(btn_stop, LV_ALIGN_BOTTOM_RIGHT, -10, -50);
-  lv_obj_add_event_cb(btn_stop, stop_btn_event_cb, LV_EVENT_CLICKED, NULL);
-  {
-    lv_obj_t *lbl = lv_label_create(btn_stop);
-    lv_label_set_text(lbl, "STOP");
-    lv_obj_center(lbl);
-  }*/
 
   // -------- Track prev "<" --------
-  btn_prev_track = lv_btn_create(lv_scr_act());
+  btn_prev_track = lv_btn_create(screen_lap);
   lv_obj_set_size(btn_prev_track, 40, 30);
   lv_obj_align(btn_prev_track, LV_ALIGN_BOTTOM_LEFT, 10, -10);
   lv_obj_add_event_cb(btn_prev_track, track_btn_event_cb, LV_EVENT_CLICKED, NULL);
@@ -778,7 +867,7 @@ void lvgl_ui_init() {
   }
 
   // -------- Track next ">" --------
-  btn_next_track = lv_btn_create(lv_scr_act());
+  btn_next_track = lv_btn_create(screen_lap);
   lv_obj_set_size(btn_next_track, 40, 30);
   lv_obj_align(btn_next_track, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
   lv_obj_add_event_cb(btn_next_track, track_btn_event_cb, LV_EVENT_CLICKED, NULL);
@@ -789,28 +878,165 @@ void lvgl_ui_init() {
   }
 
   // -------- Track name --------
-  label_track = lv_label_create(lv_scr_act());
+  label_track = lv_label_create(screen_lap);
   lv_label_set_text(label_track, TRACKS[currentTrackIndex].name);
   lv_obj_align(label_track, LV_ALIGN_BOTTOM_MID, 0, -10);
 
   // ----- REAL GPS button -----
-  lv_obj_t *btn_real = lv_btn_create(lv_scr_act());
+  lv_obj_t *btn_real = lv_btn_create(screen_lap);
   lv_obj_set_size(btn_real, 60, 30);
   lv_obj_align(btn_real, LV_ALIGN_BOTTOM_RIGHT, -10, -120);
-  lv_obj_add_event_cb(btn_real, [](lv_event_t *e){
-    fakeOverrideEnabled = false;
-    Serial.println("FAKE MODE DISABLED - REAL GNSS ACTIVE");
-  }, LV_EVENT_CLICKED, NULL);
 
-{
+  lv_obj_add_event_cb(btn_real, [](lv_event_t *e){
+  lv_event_code_t code = lv_event_get_code(e);
+
+    if (code == LV_EVENT_PRESSED) {
+      uiRealPressStart = millis();
+      uiRealPressed = true;
+    }
+    else if (code == LV_EVENT_RELEASED) {
+      if (!uiRealPressed) return;
+        uiRealPressed = false;
+        unsigned long elapsed = millis() - uiRealPressStart;
+
+      if (elapsed >= LONG_PRESS_MS) {
+        // LONG PRESS → REAL GPS mode
+        fakeOverrideEnabled = false;
+        Serial.println("REAL GPS MODE ACTIVATED (UI LONG PRESS)");
+      } else {
+        // SHORT PRESS → page toggle
+        togglePage();
+        Serial.println("PAGE SWITCH (UI SHORT PRESS: REAL)");
+      }
+    }
+  }, LV_EVENT_ALL, NULL);
+
+  {
     lv_obj_t *lbl = lv_label_create(btn_real);
     lv_label_set_text(lbl, "REAL");
     lv_obj_center(lbl);
+  }
 }
+
+// ===================================
+// LVGL Telemetry UI
+// ===================================
+
+void telemetry_ui_init() {
+  onTelemetryPage = true;
+
+  // Create a **dedicated screen** for the telemetry page
+    screen_tele = lv_obj_create(NULL);
+    lv_scr_load(screen_tele);
+
+  // -------- Status dot (top-left) --------
+  status_dot = lv_obj_create(screen_tele);
+  lv_obj_set_size(status_dot, 12, 12);
+  lv_obj_set_style_radius(status_dot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_border_width(status_dot, 0, 0);
+  lv_obj_clear_flag(status_dot, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_align(status_dot, LV_ALIGN_TOP_LEFT, 10, 10);
+
+  // -------- GPS Status Dot (top-right) --------
+  status_GPS = lv_obj_create(screen_tele);
+  lv_obj_set_size(status_GPS, 12, 12);
+  lv_obj_set_style_radius(status_GPS, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_border_width(status_GPS, 0, 0);
+  lv_obj_clear_flag(status_GPS, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_align(status_GPS, LV_ALIGN_TOP_RIGHT, -10, 10);
+  lv_obj_set_style_bg_color(status_GPS, lv_palette_main(LV_PALETTE_RED), 0);
+
+  // --- Tap status dot to return to Lap page ---
+  lv_obj_add_event_cb(status_dot, [](lv_event_t *e){
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        togglePage();
+        Serial.println("PAGE SWITCH (tap status dot)");
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
+  // -------- Speed (top, medium font) --------
+  label_speed = lv_label_create(screen_tele);
+  lv_obj_set_style_text_font(label_speed, &lv_font_montserrat_28, 0);
+  lv_label_set_text(label_speed, "0.0 km/h");
+  lv_obj_align(label_speed, LV_ALIGN_TOP_MID, 0, 30);
+
+  // -------- Lean Gauge (semicircle) --------
+  const int GAUGE_SIZE = 160;
+
+  gauge_arc = lv_arc_create(screen_tele);
+  lv_obj_set_size(gauge_arc, GAUGE_SIZE, GAUGE_SIZE);
+  // top semicircle from left (180) to right (360)
+  lv_arc_set_bg_angles(gauge_arc, 180, 360);
+  lv_arc_set_angles(gauge_arc, 180, 360);
+  lv_arc_set_rotation(gauge_arc, 0);
+  lv_arc_set_range(gauge_arc, 0, 100);
+  lv_obj_center(gauge_arc);
+  lv_obj_set_y(gauge_arc, lv_obj_get_y(gauge_arc) + 40); // drop slightly down
+
+  // Needle line
+  needle_line = lv_line_create(gauge_arc);
+  lv_obj_set_style_line_width(needle_line, 3, 0);
+  lv_obj_set_style_line_color(needle_line, lv_palette_main(LV_PALETTE_RED), 0);
+  lv_line_set_points(needle_line, needle_points, 2);
+
+  // Max left tick
+  max_left_line = lv_line_create(gauge_arc);
+  lv_obj_set_style_line_width(max_left_line, 3, 0);
+  lv_obj_set_style_line_color(max_left_line, lv_color_hex(0xFF5500), 0);  // bright orange-red
+  lv_line_set_points(max_left_line, max_left_points, 2);
+
+  // Max right tick
+  max_right_line = lv_line_create(gauge_arc);
+  lv_obj_set_style_line_width(max_right_line, 3, 0);
+  lv_obj_set_style_line_color(max_right_line, lv_color_hex(0xFF5500), 0);  // bright orange-red
+  lv_line_set_points(max_right_line, max_right_points, 2);
+
+  // Gauge long-press to reset max lean
+  lv_obj_add_event_cb(gauge_arc, [](lv_event_t *e) {
+      lv_event_code_t code = lv_event_get_code(e);
+      if (code == LV_EVENT_PRESSED) {
+        gaugePressStart = millis();
+        gaugePressed = true;
+      } else if (code == LV_EVENT_RELEASED) {
+        if (!gaugePressed) return;
+        unsigned long elapsed = millis() - gaugePressStart;
+        gaugePressed = false;
+        if (elapsed >= LONG_PRESS_MS) {
+          tele_max_lean_left  = 0.0f;
+          tele_max_lean_right = 0.0f;
+          Serial.println("Telemetry: max lean reset via gauge long-press");
+        }
+      }
+  }, LV_EVENT_ALL, NULL);
+
+  // -------- Lean / Max / Yaw/Pitch labels --------
+
+  // Current lean
+  label_lean = lv_label_create(screen_tele);
+  lv_obj_set_style_text_font(label_lean, &lv_font_montserrat_16, 0);
+  lv_label_set_text(label_lean, "Lean: 0.0°");
+  lv_obj_align(label_lean, LV_ALIGN_CENTER, 0, 70);
+
+  // Max left/right
+  label_max_left = lv_label_create(screen_tele);
+  lv_obj_set_style_text_font(label_max_left, &lv_font_montserrat_14, 0);
+  lv_label_set_text(label_max_left, "Max L: 0.0°");
+  lv_obj_align(label_max_left, LV_ALIGN_BOTTOM_LEFT, 10, -20);
+
+  label_max_right = lv_label_create(screen_tele);
+  lv_obj_set_style_text_font(label_max_right, &lv_font_montserrat_14, 0);
+  lv_label_set_text(label_max_right, "Max R: 0.0°");
+  lv_obj_align(label_max_right, LV_ALIGN_BOTTOM_RIGHT, -10, -20);
+
+  // Yaw/Pitch (bottom centre)
+  label_yawpitch = lv_label_create(screen_tele);
+  lv_obj_set_style_text_font(label_yawpitch, &lv_font_montserrat_14, 0);
+  lv_label_set_text(label_yawpitch, "Yaw: 0.0°  Pitch: 0.0°");
+  lv_obj_align(label_yawpitch, LV_ALIGN_BOTTOM_MID, 0, -5);
 
 
   // ----- FAKE SPEED 120 -----
-  lv_obj_t *btn_fake120 = lv_btn_create(lv_scr_act());
+  lv_obj_t *btn_fake120 = lv_btn_create(screen_tele);
   lv_obj_set_size(btn_fake120, 60, 30);
   lv_obj_align(btn_fake120, LV_ALIGN_BOTTOM_RIGHT, -10, -50);
   lv_obj_add_event_cb(btn_fake120, [](lv_event_t *e){
@@ -825,7 +1051,7 @@ void lvgl_ui_init() {
   }
 
   // ----- FAKE SPEED 0 -----
-  lv_obj_t *btn_fake0 = lv_btn_create(lv_scr_act());
+  lv_obj_t *btn_fake0 = lv_btn_create(screen_tele);
   lv_obj_set_size(btn_fake0, 60, 30);
   lv_obj_align(btn_fake0, LV_ALIGN_BOTTOM_RIGHT, -10, -85);
   lv_obj_add_event_cb(btn_fake0, [](lv_event_t *e){
@@ -840,7 +1066,7 @@ void lvgl_ui_init() {
   }
 
   // ----- Long press anywhere to reset laps -----
-  lv_obj_add_event_cb(lv_scr_act(), [](lv_event_t *e){
+  lv_obj_add_event_cb(screen_tele, [](lv_event_t *e){
     if (lv_event_get_code(e) == LV_EVENT_LONG_PRESSED) {
         show_reset_popup();
     }
@@ -903,6 +1129,140 @@ void handleSerialCommands() {
 }
 
 // =======================
+// Update the telemetry
+// =======================
+
+static void set_label_float(lv_obj_t *lbl, const char *prefix, float value, const char *suffix = "")
+{
+  char buf[32];
+  dtostrf(value, 0, 1, buf);   // 1 decimal place
+  char out[48];
+  snprintf(out, sizeof(out), "%s%s%s", prefix, buf, suffix);
+  lv_label_set_text(lbl, out);
+}
+
+void update_telemetry_ui() {
+  // For now, speed display is driven from currentSpeedKPH
+  float speed = currentSpeedKPH;
+  float lean = tele_lean_deg;
+
+  // Speed
+  {
+    char buf[32];
+    dtostrf(speed, 0, 1, buf);
+    char out[40];
+    snprintf(out, sizeof(out), "%s km/h", buf);
+    lv_label_set_text(label_speed, out);
+  }
+
+  // Lean
+  set_label_float(label_lean, "Lean: ", lean, "°");
+
+  // Max left / right
+  set_label_float(label_max_left,  "Max L: ", fabsf(tele_max_lean_left), "°");
+  set_label_float(label_max_right, "Max R: ", fabsf(tele_max_lean_right), "°");
+
+  // Yaw + pitch
+  {
+    char yawbuf[16], pitchbuf[16], out[48];
+    dtostrf(tele_yaw_deg, 0, 1, yawbuf);
+    dtostrf(tele_pitch_deg, 0, 1, pitchbuf);
+    snprintf(out, sizeof(out), "Yaw: %s°  Pitch: %s°", yawbuf, pitchbuf);
+    lv_label_set_text(label_yawpitch, out);
+  }
+  
+  // --- Lean live + maxima ---
+  const float LEAN_MAX = 60.0f;
+  if (lean > LEAN_MAX) lean = LEAN_MAX;
+  if (lean < -LEAN_MAX) lean = -LEAN_MAX;
+
+  // Update max left/right
+  if (lean < tele_max_lean_left)
+    tele_max_lean_left = lean;
+  if (lean > tele_max_lean_right)
+    tele_max_lean_right = lean;
+
+  // --- Needle + tick geometry ---
+  // Map lean [-60..+60] -> LVGL angle [180..360] (left..top..right)
+  float angle_lean = 270.0f + (lean * 90.0f / LEAN_MAX);
+
+  // Use same mapping for max left/right (if non-zero)
+  float angle_maxL = 270.0f + (tele_max_lean_left * 90.0f / LEAN_MAX);
+  float angle_maxR = 270.0f + (tele_max_lean_right * 90.0f / LEAN_MAX);
+
+  int size = lv_obj_get_width(gauge_arc);
+  int cx = size / 2;
+  int cy = size / 2;
+  float radius = (float)size / 2.0f - 6.0f;  // margin from edge
+
+  auto set_line_from_angle = [&](lv_point_t *pts, float angleDeg, float rInner, float rOuter) {
+    float rad = angleDeg * DEG2RAD;
+    pts[0].x = cx + (int16_t)(rInner * cosf(rad));
+    pts[0].y = cy + (int16_t)(rInner * sinf(rad));
+    pts[1].x = cx + (int16_t)(rOuter * cosf(rad));
+    pts[1].y = cy + (int16_t)(rOuter * sinf(rad));
+  };
+
+  // Needle: full radius from centre to arc
+  set_line_from_angle(needle_points, angle_lean, 0.0f, radius);
+  lv_line_set_points(needle_line, needle_points, 2);
+
+  // Max L/R ticks: small segments near the arc
+  float rInnerTick = radius - 6.0f;
+  float rOuterTick = radius;
+
+  set_line_from_angle(max_left_points, angle_maxL, rInnerTick, rOuterTick);
+  lv_line_set_points(max_left_line, max_left_points, 2);
+
+  set_line_from_angle(max_right_points, angle_maxR, rInnerTick, rOuterTick);
+  lv_line_set_points(max_right_line, max_right_points, 2);
+
+  // -------- Status dot (session) --------
+  lv_color_t col;
+  if (sessionActive)
+    col = lv_palette_main(LV_PALETTE_GREEN);
+  else if (sessionWasManuallyStopped)
+    col = lv_palette_main(LV_PALETTE_RED);
+  else
+    col = lv_palette_main(LV_PALETTE_BLUE);
+
+  if (status_dot) {
+    lv_obj_set_style_bg_color(status_dot, col, 0);
+  }
+
+  // -------- GPS Status Dot --------
+  
+  RaceboxSnapshot rbx;
+  racebox_get_snapshot(rbx);
+
+  lv_color_t gpsCol;
+
+  // Fake override always wins
+  if (fakeOverrideEnabled) {
+      gpsCol = lv_palette_main(LV_PALETTE_YELLOW);
+  }
+  else {
+    if (!rbx.connected) {
+        // No BLE → no data at all
+        gpsCol = lv_palette_main(LV_PALETTE_RED);
+    }
+    else {
+        // Connected → check fix status
+        if (racebox_has_valid_fix()) {
+            gpsCol = lv_palette_main(LV_PALETTE_GREEN);
+        } else {
+            gpsCol = lv_palette_main(LV_PALETTE_BLUE);
+        }
+    }
+  }
+
+  lv_obj_set_style_bg_color(status_GPS, gpsCol, 0);
+
+  // We can treat this as "UI has drawn once" too
+  uiHasDrawnOnce = true;
+}
+
+// =======================
 // UI UPDATE
 // =======================
 void update_ui() {
@@ -950,24 +1310,24 @@ void update_ui() {
   // -------- Status dot --------
   lv_color_t col;
   if (sessionActive)
-    col = lv_palette_main(LV_PALETTE_GREEN);
+    col = lv_palette_main(LV_PALETTE_GREEN); // Active session
   else if (sessionWasManuallyStopped)
-    col = lv_palette_main(LV_PALETTE_RED);
+    col = lv_palette_main(LV_PALETTE_RED); // Manual stop
   else
-    col = lv_palette_main(LV_PALETTE_BLUE);
+    col = lv_palette_main(LV_PALETTE_BLUE); // Standby
 
   lv_obj_set_style_bg_color(status_dot, col, 0);
 
   // -------- GPS Status Dot --------
   lv_color_t gpsCol;
   if (fakeOverrideEnabled) {
-    gpsCol = lv_palette_main(LV_PALETTE_CYAN);    // pretend no fix
+    gpsCol = lv_palette_main(LV_PALETTE_YELLOW); // pretend no fix
   }
   else if (racebox_has_valid_fix()) {
     gpsCol = lv_palette_main(LV_PALETTE_GREEN);  // real fix
   }
   else if (rbHasSpeed) {
-    gpsCol = lv_palette_main(LV_PALETTE_ORANGE); // BLE but no fix
+    gpsCol = lv_palette_main(LV_PALETTE_BLUE); // BLE but no fix
   }
   else {
     gpsCol = lv_palette_main(LV_PALETTE_RED);    // no data
@@ -1065,89 +1425,81 @@ void loop() {
   // ===========================================
 // 1) RaceBox vs Fake GPS + GPS Outage Grace
 // ===========================================
-  {
     // How long we tolerate missing GPS before stopping session
     const unsigned long GPS_OUTAGE_GRACE_MS = 5000;
     static unsigned long gpsLossStart = 0;
 
-    if (recordingEnabled)
+    RaceboxSnapshot rbx;
+    racebox_get_snapshot(rbx);
+
+    // IMU ALWAYS UPDATES whenever BLE is connected
+    if (rbx.connected) {
+    tele_lean_deg   = -rbx.leanDeg;
+    tele_yaw_deg    = rbx.yawDeg;
+    tele_pitch_deg = atan2(rbx.gX, rbx.gZ) * 57.2957795f;
+    }
+
+    if (recordingEnabled) {
+    // -------------------------
+    // FAKE OVERRIDE MODE
+    // -------------------------
+    }
+
+    if (fakeOverrideEnabled)
     {
-        // -------------------------
-        // FAKE OVERRIDE MODE
-        // -------------------------
-        if (fakeOverrideEnabled)
-        {
-            // Force fake GNSS path
-            feedFakeGps();
-            currentSpeedKPH = fakeOverrideSpeedKPH;
-            rbHasSpeed = false;       // pretend no RaceBox data
-            gpsLossStart = 0;         // fake mode means no outage logic
-        }
+        // Fake GNSS path only affects speed + lap simulation
+        feedFakeGps();
+        currentSpeedKPH = fakeOverrideSpeedKPH;
+        rbHasSpeed = false;
+        gpsLossStart = 0;
+    }
+    else {
+        // REAL MODE
+        if (racebox_has_valid_fix()) {
+            rbHasSpeed      = true;
+            currentSpeedKPH = rbx.speedKPH;
 
-        // -------------------------
-        // REAL MODE (RaceBox only)
-        // -------------------------
-        else
-        {
-            RaceboxSnapshot rbx;
-            racebox_get_snapshot(rbx);
+            gpsLossStart = 0;
 
-            if (racebox_has_valid_fix())
-            {
-                // FULL REAL GNSS AVAILABLE
-                rbHasSpeed      = true;
-                currentSpeedKPH = rbx.speedKPH;
-
-                gpsLossStart = 0; // reset outage timer
-
-                if (rbx.latDeg != 0.0 || rbx.lonDeg != 0.0)
-                    updateLapFromLatLon(rbx.latDeg, rbx.lonDeg);
+            if (rbx.latDeg != 0.0 || rbx.lonDeg != 0.0)
+            updateLapFromLatLon(rbx.latDeg, rbx.lonDeg);
             }
-            else
-            {
-                // NO FIX — apply GRACE LOGIC
-                rbHasSpeed = false;
+        else {
+            // outage logic stays identical
+            rbHasSpeed = false;
 
-                if (gpsLossStart == 0)
-                {
-                    gpsLossStart = millis();   // begin outage window
-                }
+            if (gpsLossStart == 0)
+                gpsLossStart = millis();
 
-                unsigned long outage = millis() - gpsLossStart;
+            unsigned long outage = millis() - gpsLossStart;
 
-                if (outage >= GPS_OUTAGE_GRACE_MS)
-                {
-                    // FIX REALLY LOST → zero speed
+            if (outage >= GPS_OUTAGE_GRACE_MS) {
                     currentSpeedKPH = 0.0f;
 
-                    if (sessionActive)
-                    {
+                if (sessionActive) {
                         sessionActive = false;
                         sessionWasManuallyStopped = false;
                         autoStartEnabled = true;
                         haveCurrentLap = false;
                         lowSpeedStartMs = 0;
                         Serial.println("SESSION STOPPED (GPS LOST)");
-                    }
                 }
-                else
-                {
-                    // grace period active → do not kill session yet
-                    // hold last known speed, don't simulate movement
-                    // If you prefer “force 0” here, change this line:
-                    currentSpeedKPH = currentSpeedKPH;
-                }
+            }
+            else {
+                // hold last speed during grace
+                currentSpeedKPH = currentSpeedKPH;
             }
         }
     }
-    else
-    {
-        // Recording disabled = hard stop on everything
-        rbHasSpeed      = false;
-        currentSpeedKPH = 0.0f;
-        gpsLossStart    = 0;
-    }
+
+
+  if (!rbx.connected) {
+      // Recording disabled = hard stop on everything
+      rbHasSpeed      = false;
+      currentSpeedKPH = 0.0f;
+      gpsLossStart    = 0;
   }
+
 
   // *** 1b) BLE housekeeping (cheap, non-blocking) ***
   racebox_tick();
@@ -1162,7 +1514,12 @@ void loop() {
   handleHardwareButtons();
 
   // 5) UI update
-  update_ui();
+    // 5) UI update
+  if (onTelemetryPage) {
+    update_telemetry_ui();
+  } else {
+    update_ui();
+  }
 
   // 6) LVGL
   lv_tick_inc(20);
