@@ -609,6 +609,16 @@ void feedFakeGps() {
 void sessionAutoController() {
   float speed;
 
+  RaceboxSnapshot rbx;
+  racebox_get_snapshot(rbx);
+
+  // Block auto-start unless:
+  //   • Fake mode is ON, OR
+  //   • RaceBox is connected AND has a valid fix
+  bool canAutoStart =
+    fakeOverrideEnabled ||
+    (rbx.connected && racebox_has_valid_fix());
+
   if (fakeOverrideEnabled) {
     speed = fakeOverrideSpeedKPH;
   } else if (rbHasSpeed) {
@@ -619,15 +629,16 @@ void sessionAutoController() {
 
   // AUTO START
   if (!sessionActive &&
-      autoStartEnabled &&
-      speed > 30.0f)
-  {
+    autoStartEnabled &&
+    canAutoStart &&      // << NEW GUARD
+    speed > 30.0f)
+{
     sessionActive = true;
     sessionWasManuallyStopped = false;
     haveCurrentLap = false;
     lowSpeedStartMs = 0;
     Serial.println("SESSION AUTO-STARTED");
-  }
+}
 
   // AUTO STOP
   if (sessionActive) {
@@ -1237,26 +1248,21 @@ void update_telemetry_ui() {
 
   lv_color_t gpsCol;
 
-  // Fake override always wins
   if (fakeOverrideEnabled) {
-      gpsCol = lv_palette_main(LV_PALETTE_YELLOW);
+    gpsCol = lv_palette_main(LV_PALETTE_YELLOW);       // Fake mode
+  }
+  else if (!rbx.connected) {
+    gpsCol = lv_palette_main(LV_PALETTE_RED);          // No BLE
+  }
+  else if (racebox_has_valid_fix()) {
+    gpsCol = lv_palette_main(LV_PALETTE_GREEN);        // BLE + Fix
   }
   else {
-    if (!rbx.connected) {
-        // No BLE → no data at all
-        gpsCol = lv_palette_main(LV_PALETTE_RED);
-    }
-    else {
-        // Connected → check fix status
-        if (racebox_has_valid_fix()) {
-            gpsCol = lv_palette_main(LV_PALETTE_GREEN);
-        } else {
-            gpsCol = lv_palette_main(LV_PALETTE_BLUE);
-        }
-    }
+    gpsCol = lv_palette_main(LV_PALETTE_BLUE);         // BLE, no fix
   }
 
   lv_obj_set_style_bg_color(status_GPS, gpsCol, 0);
+
 
   // We can treat this as "UI has drawn once" too
   uiHasDrawnOnce = true;
@@ -1319,23 +1325,25 @@ void update_ui() {
   lv_obj_set_style_bg_color(status_dot, col, 0);
 
   // -------- GPS Status Dot --------
+  RaceboxSnapshot rbx;
+  racebox_get_snapshot(rbx);
+
   lv_color_t gpsCol;
+
   if (fakeOverrideEnabled) {
-    gpsCol = lv_palette_main(LV_PALETTE_YELLOW); // pretend no fix
+    gpsCol = lv_palette_main(LV_PALETTE_YELLOW);       // Fake mode
+  }
+  else if (!rbx.connected) {
+    gpsCol = lv_palette_main(LV_PALETTE_RED);          // No BLE
   }
   else if (racebox_has_valid_fix()) {
-    gpsCol = lv_palette_main(LV_PALETTE_GREEN);  // real fix
-  }
-  else if (rbHasSpeed) {
-    gpsCol = lv_palette_main(LV_PALETTE_BLUE); // BLE but no fix
+    gpsCol = lv_palette_main(LV_PALETTE_GREEN);        // BLE + Fix
   }
   else {
-    gpsCol = lv_palette_main(LV_PALETTE_RED);    // no data
+    gpsCol = lv_palette_main(LV_PALETTE_BLUE);         // BLE, no fix
   }
 
   lv_obj_set_style_bg_color(status_GPS, gpsCol, 0);
-
-  uiHasDrawnOnce = true;   // First valid frame happened
 
 }
 
@@ -1436,7 +1444,7 @@ void loop() {
     if (rbx.connected) {
     tele_lean_deg   = -rbx.leanDeg;
     tele_yaw_deg    = rbx.yawDeg;
-    tele_pitch_deg = atan2(rbx.gX, rbx.gZ) * 57.2957795f;
+    tele_pitch_deg = -atan2(rbx.gX, rbx.gZ) * 57.2957795f;
     }
 
     if (recordingEnabled) {
